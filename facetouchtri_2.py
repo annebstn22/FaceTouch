@@ -1,52 +1,8 @@
-"""
-Detect hand-to-face contact using MediaPipe Face Mesh + Hands.
-
-For each detected hand landmark, this script finds the closest *front-facing* triangle
-on the face mesh. If the minimum point-to-triangle distance falls below a threshold,
-the script considers the face "touched" and emits a UDP event identifying the
-approximate facial region (forehead, cheek, chin, etc.).
-
-UDP message format:
-    {"region": "<region-name>"}
-
-The receiver is expected to listen on 127.0.0.1:5055 and render a corresponding
-visual overlay (e.g., a dot on the selected region).
-"""
 import cv2
 import mediapipe as mp
 import numpy as np
-import socket
-import json
 
-# UDP socket used to notify the overlay process.
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-def send_dot(region):
-    """Send a region event to the local overlay via UDP."""
-    msg = json.dumps({"region": region})
-    sock.sendto(msg.encode(), ("127.0.0.1", 5055))
-
-
-# Map rough facial regions to Face Mesh landmark indices.
-# Tweak these sets to change which triangles are classified into which region.
-FACE_REGIONS = {
-    "orange": set(range(10, 110)),       # forehead
-    "yellow": {1,2,3,4,5,197,6},         # nose bridge
-    "pink": set(range(234, 253)),        # left cheek
-    "red": set(range(350, 455)),         # right cheek
-    "blue": set(range(152, 200)),        # chin
-    "green": set(range(127, 152)),       # jawline
-}
-
-def get_triangle_region(i1, i2, i3):
-    """Classify a triangle by any of its vertex landmark indices."""
-    for region, ids in FACE_REGIONS.items():
-        if (i1 in ids) or (i2 in ids) or (i3 in ids):
-            return region
-    return None
-
-
-# MediaPipe models.
+# --- Setup ---
 mp_face_mesh = mp.solutions.face_mesh
 mp_hands = mp.solutions.hands
 mp_draw = mp.solutions.drawing_utils
@@ -54,7 +10,8 @@ mp_draw = mp.solutions.drawing_utils
 face_mesh = mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True, min_detection_confidence=0.5)
 hands = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.5)
 
-# Face mesh triangulation (triplets of landmark indices).
+# MediaPipe Face Mesh Triangulation
+# (Use your existing FACE_MESH_TRIANGLES list)
 FACE_MESH_TRIANGLES = [
     (127, 34, 139), (11, 0, 37), (232, 231, 120), (72, 37, 39), (128, 121, 47),
     (232, 121, 128), (104, 69, 67), (175, 171, 148), (118, 50, 101), (73, 39, 40),
@@ -101,20 +58,14 @@ TOUCH_DIST_THRESHOLD = 0.025  # Distance threshold in normalized 3D units
 cap = cv2.VideoCapture(1)
 cv2.namedWindow("Webcam", cv2.WINDOW_NORMAL)
 
+# --- Geometry helpers ---
 def is_front_facing(p1, p2, p3):
-    """Return True if triangle normal points toward the camera (heuristic)."""
     v1 = p2 - p1
     v2 = p3 - p1
     normal = np.cross(v1, v2)
     return normal[2] < 0
 
 def point_to_triangle_distance(p, a, b, c):
-    """Compute Euclidean distance from point p to triangle (a, b, c) in 3D.
-
-    If the orthogonal projection of p onto the triangle plane lies inside the
-    triangle, this returns the absolute distance to the plane. Otherwise, it
-    returns the minimum distance to the triangle edges.
-    """
     ab = b - a
     ac = c - a
     normal = np.cross(ab, ac)
@@ -138,14 +89,12 @@ def point_to_triangle_distance(p, a, b, c):
     v = (dot00 * dot12 - dot01 * dot02) * inv_denom
     if (u >= 0) and (v >= 0) and (u + v <= 1):
         return abs(dist_to_plane)
-    return min(
-        point_to_segment_distance(p, a, b),
-        point_to_segment_distance(p, b, c),
-        point_to_segment_distance(p, c, a)
-    )
+    dist_ab = point_to_segment_distance(p, a, b)
+    dist_bc = point_to_segment_distance(p, b, c)
+    dist_ca = point_to_segment_distance(p, c, a)
+    return min(dist_ab, dist_bc, dist_ca)
 
 def point_to_segment_distance(p, a, b):
-    """Compute Euclidean distance from point p to segment [a, b] in 3D."""
     ab = b - a
     ap = p - a
     ab_len_sq = np.dot(ab, ab)
@@ -155,9 +104,10 @@ def point_to_segment_distance(p, a, b):
     closest = a + t * ab
     return np.linalg.norm(p - closest)
 
-# Main capture loop: detect face/hands, compute touch events, render UI.
-was_touching = False
+# --- Main loop ---
+frame_count = 0
 touch_count = 0
+was_touching = False
 
 while True:
     ret, frame = cap.read()
@@ -166,23 +116,24 @@ while True:
 
     frame = cv2.flip(frame, 1)
     h, w, _ = frame.shape
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    face_results = face_mesh.process(frame_rgb)
+    hand_results = hands.process(frame_rgb)
 
-    face_results = face_mesh.process(rgb)
-    hand_results = hands.process(rgb)
-
+    touch_points = []
     touching = False
-    touched_regions = set()
+    frame_count += 1
 
     if face_results.multi_face_landmarks and hand_results.multi_hand_landmarks:
-        face_pts = np.array([[lm.x, lm.y, lm.z] 
-                             for lm in face_results.multi_face_landmarks[0].landmark])
+        face_landmarks = face_results.multi_face_landmarks[0].landmark
+        face_pts = np.array([[lm.x, lm.y, lm.z] for lm in face_landmarks])
 
         for hand_landmarks in hand_results.multi_hand_landmarks:
-            for h_lm in hand_landmarks.landmark:
+            for h_idx, h_lm in enumerate(hand_landmarks.landmark):
                 hand_pt = np.array([h_lm.x, h_lm.y, h_lm.z])
+                
                 min_dist = np.inf
-                best_region = None
+                closest_triangle = None
 
                 for (i1, i2, i3) in FACE_MESH_TRIANGLES:
                     if i1 >= len(face_pts) or i2 >= len(face_pts) or i3 >= len(face_pts):
@@ -190,48 +141,67 @@ while True:
                     v1, v2, v3 = face_pts[i1], face_pts[i2], face_pts[i3]
                     if not is_front_facing(v1, v2, v3):
                         continue
-
-                    # Quick AABB reject in normalized image space to avoid the
-                    # more expensive point-to-triangle distance calculation.
-                    if not (min(v1[0], v2[0], v3[0]) - 0.05 <= hand_pt[0] <= max(v1[0], v2[0], v3[0]) + 0.05):
+                    min_x = min(v1[0], v2[0], v3[0]) - 0.05
+                    max_x = max(v1[0], v2[0], v3[0]) + 0.05
+                    min_y = min(v1[1], v2[1], v3[1]) - 0.05
+                    max_y = max(v1[1], v2[1], v3[1]) + 0.05
+                    if not (min_x <= hand_pt[0] <= max_x and min_y <= hand_pt[1] <= max_y):
                         continue
-                    if not (min(v1[1], v2[1], v3[1]) - 0.05 <= hand_pt[1] <= max(v1[1], v2[1], v3[1]) + 0.05):
-                        continue
-
                     dist = point_to_triangle_distance(hand_pt, v1, v2, v3)
                     if dist < min_dist:
-                        region = get_triangle_region(i1, i2, i3)
-                        if region is not None:
-                            min_dist = dist
-                            best_region = region
+                        min_dist = dist
+                        closest_triangle = (v1, v2, v3)
 
-                if min_dist < TOUCH_DIST_THRESHOLD and best_region is not None:
-                    touching = True
-                    touched_regions.add(best_region)
+                if min_dist < TOUCH_DIST_THRESHOLD and closest_triangle is not None:
+                    v1, v2, v3 = closest_triangle
+                    avg_face_z = (v1[2] + v2[2] + v3[2]) / 3
+                    if hand_pt[2] <= avg_face_z + 0.05:
+                        hx, hy = int(h_lm.x * w), int(h_lm.y * h)
+                        touch_points.append((hx, hy))
+                        touching = True
 
-    # Emit events on the rising edge (new touch), not every frame.
+    # --- Increment touch count only on new touch ---
     if touching and not was_touching:
-        for region in touched_regions:
-            print("Sending dot for region:", region)
-            send_dot(region)
         touch_count += 1
-
     was_touching = touching
 
-    # Simple on-screen status overlay.
-    cv2.putText(frame,
-                "TOUCHING FACE!" if touching else "No contact",
-                (10, 40),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1.2,
-                (0,0,255) if touching else (0,255,0),
-                3)
+    # --- Visualization ---
+    if face_results.multi_face_landmarks:
+        mp_draw.draw_landmarks(
+            frame, 
+            face_results.multi_face_landmarks[0], 
+            mp_face_mesh.FACEMESH_TESSELATION,
+            landmark_drawing_spec=None,
+            connection_drawing_spec=mp_draw.DrawingSpec(color=(80, 110, 10), thickness=1)
+        )
 
-    cv2.putText(frame, f"Face touches: {touch_count}", (10, 80),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+    if hand_results.multi_hand_landmarks:
+        for hand_landmarks in hand_results.multi_hand_landmarks:
+            mp_draw.draw_landmarks(
+                frame, 
+                hand_landmarks, 
+                mp_hands.HAND_CONNECTIONS,
+                mp_draw.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=3),
+                mp_draw.DrawingSpec(color=(0, 200, 0), thickness=2)
+            )
+
+    if len(touch_points) > 0:
+        overlay = frame.copy()
+        for (tx, ty) in touch_points:
+            cv2.circle(overlay, (tx, ty), 35, (0, 0, 255), -1)
+        frame = cv2.addWeighted(overlay, 0.5, frame, 0.5, 0)
+
+    status_text = "TOUCHING FACE!" if touching else "No contact"
+    status_color = (0, 0, 255) if touching else (0, 255, 0)
+    cv2.putText(frame, status_text, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, status_color, 3)
+
+    cv2.putText(frame, f"Touch points: {len(touch_points)}", (10, 80), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    cv2.putText(frame, f"Face touches: {touch_count}", (10, 110), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
     cv2.imshow("Webcam", frame)
-    if cv2.waitKey(1) & 0xFF == ord("q"):
+    if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
 cap.release()
