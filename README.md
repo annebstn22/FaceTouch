@@ -1,5 +1,4 @@
 # FaceTouch
-# FaceTouch
 
 FaceTouch is an AI-powered project designed to help users become more aware of their face-touching habits and reduce the spread of germs. Using computer vision, it detects when a user is about to touch their face and provides real-time feedback.
 
